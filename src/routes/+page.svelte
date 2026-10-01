@@ -4,6 +4,7 @@
     Button,
     Checkbox,
     InlineNotification,
+    Modal,
     Select,
     SelectItem,
     Tag,
@@ -11,6 +12,27 @@
     TextInput,
     Tile
   } from 'carbon-components-svelte';
+  import {
+    buildView,
+    confirmIdentity,
+    courseSignature,
+    emptyReconcileState,
+    importResultPackage,
+    loadReconcileState,
+    parseResultPackageText,
+    planSignature,
+    RECONCILE_STORAGE_KEY,
+    refreshDerivations,
+    resolveConflict,
+    resolvePrerequisite,
+    type CourseLite,
+    type ImportSummary,
+    type PendingItem,
+    type ReconcileState,
+    type ReconcileView,
+    type Role
+  } from '$lib/reconcile';
+  import { demoPackages } from '$lib/demoPackages';
 
   type ActivityType = '音素' | '单词' | '句子' | '练习';
   type ViewMode = 'compose' | 'path' | 'issues' | 'versions';
@@ -180,6 +202,176 @@
   $: warningCount = diagnostics.filter((issue) => issue.level === 'warning').length;
   $: totalMinutes = course.activities.reduce((sum, activity) => sum + activity.duration, 0);
 
+  // ---------- 听读结果包对账 ----------
+  type QaTab = 'diagnostics' | 'reconcile';
+  let qaTab: QaTab = 'diagnostics';
+  let reconcile: ReconcileState = emptyReconcileState();
+  let reconcileView: ReconcileView | null = null;
+  let reconcileHydrated = false;
+  let lastCourseSignature = '';
+  let lastPlanSignature = '';
+  let recomputeNotice = '';
+  let importModalOpen = false;
+  let importDraft = '';
+  let importError = '';
+  let lastImportSummary: ImportSummary | null = null;
+  let pendingModalOpen = false;
+  let activePendingId = '';
+  let pendingDraft = { studentId: '', activityId: '', winnerResultId: '', decision: 'practice' as 'practice' | 'waive', note: '' };
+  let actionError = '';
+  let expandedLedgerKeys: string[] = [];
+
+  const toCourseLite = (current: Course): CourseLite => ({
+    id: current.id,
+    activities: current.activities.map((activity) => ({
+      id: activity.id, type: activity.type, title: activity.title,
+      phonemes: activity.phonemes, dependencies: activity.dependencies
+    }))
+  });
+
+  // 课程顺序、音素或依赖变化即按新课程重算；旧结果包照常核对
+  function syncReconcile(noticeCourseChange = false): void {
+    if (!reconcileHydrated) return;
+    const lite = toCourseLite(course);
+    // buildView 内部先按当前课程重算待确认，再派生台账与补练清单
+    reconcileView = buildView(reconcile, [lite]);
+    const signature = planSignature(reconcileView.plans);
+    const courseNow = courseSignature(lite);
+    if (noticeCourseChange && lastCourseSignature && lastCourseSignature !== courseNow && reconcile.results.length) {
+      recomputeNotice = '课程顺序、音素或依赖已调整，补练清单已按当前课程立即重算；旧结果包仍保留并继续核对。';
+    } else if (!noticeCourseChange && lastPlanSignature && lastPlanSignature !== signature && reconcile.results.length) {
+      recomputeNotice = '新结果或确认已写回，相关补练安排已失效并重新计算。';
+    }
+    lastCourseSignature = courseNow;
+    lastPlanSignature = signature;
+    persistReconcile();
+  }
+
+  function persistReconcile(): void {
+    if (!reconcileHydrated) return;
+    localStorage.setItem(RECONCILE_STORAGE_KEY, JSON.stringify(reconcile));
+  }
+
+  let activePending: PendingItem | null = null;
+
+  function setRole(role: Role): void {
+    reconcile = { ...reconcile, role };
+    persistReconcile();
+  }
+
+  function openImport(): void {
+    importModalOpen = true;
+    importError = '';
+  }
+
+  function closeImport(): void {
+    importModalOpen = false;
+  }
+
+  function readImportFile(event: Event): void {
+    const input = event.target as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => { importDraft = String(reader.result ?? ''); importError = ''; };
+    reader.readAsText(file);
+    input.value = '';
+  }
+
+  function performImport(): void {
+    const text = importDraft;
+    let parsed;
+    try {
+      parsed = parseResultPackageText(text);
+    } catch (error) {
+      importError = error instanceof Error ? error.message : '结果包解析失败';
+      return;
+    }
+    if (!parsed.results?.length) { importError = '结果包里没有可导入的结果记录'; return; }
+    const { state: next, summary } = importResultPackage(reconcile, parsed, [toCourseLite(course)]);
+    reconcile = next;
+    lastImportSummary = summary;
+    importDraft = '';
+    importError = '';
+    importModalOpen = false;
+    syncReconcile();
+  }
+
+  function loadDemo(key: string): void {
+    const pack = demoPackages.find((item) => item.key === key);
+    if (!pack) return;
+    importDraft = JSON.stringify(pack.data, null, 2);
+    performImport();
+  }
+
+  function openPending(item: PendingItem): void {
+    activePendingId = item.id;
+    activePending = item;
+    pendingDraft = {
+      studentId: item.studentId,
+      activityId: item.activityId,
+      winnerResultId: item.conflictScores?.[0]?.resultId ?? '',
+      decision: 'practice',
+      note: ''
+    };
+    actionError = '';
+    pendingModalOpen = true;
+  }
+
+  function closePending(): void {
+    pendingModalOpen = false;
+    activePending = null;
+  }
+
+  function submitPending(): void {
+    const item = activePending;
+    if (!item) return;
+    if (reconcile.role !== 'leader') {
+      actionError = '普通教师不能越权处理，请由教研组长确认后写回学情。';
+      return;
+    }
+    try {
+      let next: ReconcileState;
+      if (item.kind === 'identity') {
+        next = confirmIdentity(reconcile, item.id, pendingDraft.studentId, pendingDraft.activityId, pendingDraft.note, [toCourseLite(course)]);
+      } else if (item.kind === 'conflict') {
+        next = resolveConflict(reconcile, item.id, pendingDraft.winnerResultId, pendingDraft.note, [toCourseLite(course)]);
+      } else {
+        next = resolvePrerequisite(reconcile, item.id, pendingDraft.decision, pendingDraft.note, [toCourseLite(course)]);
+      }
+      reconcile = next;
+      pendingModalOpen = false;
+      activePending = null;
+      syncReconcile();
+    } catch (error) {
+      actionError = error instanceof Error ? error.message : '处理失败';
+    }
+  }
+
+  function toggleLedger(key: string): void {
+    expandedLedgerKeys = expandedLedgerKeys.includes(key)
+      ? expandedLedgerKeys.filter((item) => item !== key)
+      : [...expandedLedgerKeys, key];
+  }
+
+  function activityTitle(id: string): string {
+    return course.activities.find((activity) => activity.id === id)?.title ?? id;
+  }
+
+  function resultById(id: string) {
+    return reconcile.results.find((result) => result.id === id);
+  }
+
+  function resetReconcile(): void {
+    if (!window.confirm('确定清空本机所有听读结果、待确认与补练清单？该操作不可撤销。')) return;
+    reconcile = { ...emptyReconcileState(), role: reconcile.role };
+    recomputeNotice = '';
+    lastPlanSignature = '';
+    lastCourseSignature = courseSignature(toCourseLite(course));
+    persistReconcile();
+    syncReconcile();
+  }
+
   onMount(() => {
     const stored = localStorage.getItem(STORAGE_KEY);
     if (stored) {
@@ -194,6 +386,20 @@
       }
     }
     hydrated = true;
+
+    // 载入跨系统对账数据（关闭页面再回来仍保留确认与冲突）
+    reconcile = loadReconcileState();
+    reconcileHydrated = true;
+    if (!reconcile.seeded && reconcile.results.length === 0) {
+      const seeded = importResultPackage(reconcile, demoPackages[0].data, [toCourseLite(course)]);
+      reconcile = { ...seeded.state, seeded: true };
+      lastImportSummary = seeded.summary;
+    }
+    lastCourseSignature = courseSignature(toCourseLite(course));
+    reconcileView = buildView(reconcile, [toCourseLite(course)]);
+    lastPlanSignature = planSignature(reconcileView.plans);
+    persistReconcile();
+
     const updateNetwork = () => {
       online = navigator.onLine;
       showOfflineNotice = !online;
@@ -221,6 +427,7 @@
     course = next;
     future = [];
     persist();
+    syncReconcile(true);
   }
 
   function persist(): void {
@@ -237,6 +444,7 @@
     course = previous;
     selectedActivityId = course.activities[0]?.id ?? '';
     persist();
+    syncReconcile(true);
   }
 
   function redo(): void {
@@ -247,6 +455,7 @@
     course = next;
     selectedActivityId = course.activities[0]?.id ?? '';
     persist();
+    syncReconcile(true);
   }
 
   function saveNow(): void {
@@ -595,7 +804,7 @@
   <nav class="workspace-tabs" aria-label="工作区">
     <button class:active={activeView === 'compose'} on:click={() => activeView = 'compose'}><span>01</span><b>课程编排</b><small>活动、依赖与教学说明</small></button>
     <button class:active={activeView === 'path'} on:click={() => activeView = 'path'}><span>02</span><b>学习路径</b><small>多屏幕顺序预览</small></button>
-    <button class:active={activeView === 'issues'} on:click={() => activeView = 'issues'}><span>03</span><b>质量检查</b><small>音素、句子与反馈</small></button>
+    <button class:active={activeView === 'issues'} on:click={() => activeView = 'issues'}><span>03</span><b>质量检查</b><small>课程体检与听读对账</small></button>
     <button class:active={activeView === 'versions'} on:click={() => activeView = 'versions'}><span>04</span><b>版本与复用</b><small>复制、存档与比较</small></button>
   </nav>
 
@@ -743,28 +952,252 @@
   {#if activeView === 'issues'}
     <main class="issues-view">
       <div class="view-heading">
-        <div><span class="kicker">CURRICULUM QA</span><h2>课程质量检查</h2><p>检查前置知识、相似音、例句长度、练习反馈、无障碍说明和依赖完整性。</p></div>
-        <div class="issue-summary"><span><b>{errorCount}</b> 必须处理</span><span><b>{warningCount}</b> 建议调整</span><span><b>{diagnostics.length}</b> 全部提示</span></div>
+        <div><span class="kicker">CURRICULUM QA</span><h2>课程质量检查</h2><p>课程体检覆盖前置知识、相似音、例句长度、练习反馈、无障碍说明；听读对账按学生编号与活动编号核对课堂听读结果包。</p></div>
+        <div class="issue-summary"><span><b>{errorCount}</b> 必须处理</span><span><b>{warningCount}</b> 建议调整</span><span><b>{reconcileView?.stats.openCount ?? 0}</b> 待组长确认</span></div>
       </div>
-      <div class="issue-board">
-        {#each diagnostics as issue, index}
-          <article class:critical={issue.level === 'error'} class:caution={issue.level === 'warning'} class:info={issue.level === 'info'}>
-            <span class="issue-index">{String(index + 1).padStart(2, '0')}</span>
-            <div><div class="issue-meta"><Tag type={issue.level === 'error' ? 'red' : issue.level === 'warning' ? 'magenta' : 'blue'}>{issue.category}</Tag><small>{issue.level === 'error' ? '必须处理' : issue.level === 'warning' ? '建议调整' : '教学提示'}</small></div><h3>{issue.title}</h3><p>{issue.detail}</p></div>
-            <Button size="small" kind="ghost" on:click={() => focusIssue(issue)}>定位活动</Button>
-          </article>
-        {:else}
-          <Tile class="all-clear"><h3>课程检查通过</h3><p>教学顺序、反馈与无障碍说明均已完成。</p></Tile>
-        {/each}
-        {#if diagnostics.length}
-          <div class="rule-grid">
-            <Tile><span>前置知识</span><strong>先教后用</strong><p>非音素活动使用未单独教学的音素时阻断。</p></Tile>
-            <Tile><span>相似音</span><strong>对比教学</strong><p>发现 /b/-/p/、/f/-/v/ 等音对时建议增加辨音。</p></Tile>
-            <Tile><span>例句</span><strong>≤ 12 词</strong><p>超过建议长度时提示拆分意群。</p></Tile>
-            <Tile><span>练习</span><strong>必须有反馈</strong><p>每个练习活动都要提供可行动反馈。</p></Tile>
+
+      <div class="qa-switch" role="tablist" aria-label="质量检查页">
+        <button class:active={qaTab === 'diagnostics'} on:click={() => qaTab = 'diagnostics'}>课程体检</button>
+        <button class:active={qaTab === 'reconcile'} on:click={() => qaTab = 'reconcile'}>
+          听读结果对账
+          {#if reconcileView?.stats.openCount}<i class="qa-badge">{reconcileView.stats.openCount}</i>{/if}
+        </button>
+      </div>
+
+      {#if qaTab === 'diagnostics'}
+        <div class="issue-board">
+          {#each diagnostics as issue, index}
+            <article class:critical={issue.level === 'error'} class:caution={issue.level === 'warning'} class:info={issue.level === 'info'}>
+              <span class="issue-index">{String(index + 1).padStart(2, '0')}</span>
+              <div><div class="issue-meta"><Tag type={issue.level === 'error' ? 'red' : issue.level === 'warning' ? 'magenta' : 'blue'}>{issue.category}</Tag><small>{issue.level === 'error' ? '必须处理' : issue.level === 'warning' ? '建议调整' : '教学提示'}</small></div><h3>{issue.title}</h3><p>{issue.detail}</p></div>
+              <Button size="small" kind="ghost" on:click={() => focusIssue(issue)}>定位活动</Button>
+            </article>
+          {:else}
+            <Tile class="all-clear"><h3>课程检查通过</h3><p>教学顺序、反馈与无障碍说明均已完成。</p></Tile>
+          {/each}
+          {#if diagnostics.length}
+            <div class="rule-grid">
+              <Tile><span>前置知识</span><strong>先教后用</strong><p>非音素活动使用未单独教学的音素时阻断。</p></Tile>
+              <Tile><span>相似音</span><strong>对比教学</strong><p>发现 /b/-/p/、/f/-/v/ 等音对时建议增加辨音。</p></Tile>
+              <Tile><span>例句</span><strong>≤ 12 词</strong><p>超过建议长度时提示拆分意群。</p></Tile>
+              <Tile><span>练习</span><strong>必须有反馈</strong><p>每个练习活动都要提供可行动反馈。</p></Tile>
+            </div>
+          {/if}
+        </div>
+      {/if}
+
+      {#if qaTab === 'reconcile' && reconcileView}
+        <div class="reconcile-wrap">
+          <div class="reconcile-toolbar">
+            <div class="role-switch" role="group" aria-label="当前登录身份">
+              <span>当前身份（演示）：</span>
+              <button class:active={reconcile.role === 'teacher'} on:click={() => setRole('teacher')}>普通教师</button>
+              <button class:active={reconcile.role === 'leader'} on:click={() => setRole('leader')}>教研组长</button>
+            </div>
+            <div class="reconcile-actions">
+              {#each demoPackages as pack (pack.key)}
+                <Button size="small" kind="ghost" on:click={() => loadDemo(pack.key)}>{pack.label}</Button>
+              {/each}
+              <Button size="small" kind="tertiary" on:click={openImport}>导入结果包</Button>
+              <Button size="small" kind="ghost" on:click={resetReconcile}>清空对账数据</Button>
+            </div>
           </div>
-        {/if}
-      </div>
+
+          {#if recomputeNotice}
+            <div class="recompute-bar">
+              <InlineNotification lowContrast kind="info" title="补练清单已重算" subtitle={recomputeNotice} on:close={() => recomputeNotice = ''} />
+            </div>
+          {/if}
+          {#if lastImportSummary}
+            <div class="recompute-bar">
+              <InlineNotification lowContrast kind="success" title={`《${lastImportSummary.label}》核对完成`}
+                subtitle={`新增 ${lastImportSummary.added} 条 · 重复跳过 ${lastImportSummary.duplicated} 条 · 分数/日期修订 ${lastImportSummary.revised.length} 条 · 无法解析 ${lastImportSummary.invalid} 条`}
+                on:close={() => lastImportSummary = null} />
+            </div>
+          {/if}
+          {#if reconcile.role === 'teacher'}
+            <div class="role-hint"><Tag type="cool-gray">普通教师</Tag><span>可导入结果包与查看学情；缺号确认、冲突裁决与前置缺口处理须由教研组长确认后才写回学情。</span></div>
+          {/if}
+
+          <div class="reconcile-stats">
+            <div><strong>{reconcileView.stats.packages}</strong><span>已核结果包</span></div>
+            <div><strong>{reconcileView.stats.activeRecords}</strong><span>有效结果</span></div>
+            <div><strong>{reconcileView.stats.students}</strong><span>学生</span></div>
+            <div><strong class="ok">{reconcileView.stats.mastered}</strong><span>已掌握活动</span></div>
+            <div><strong class="caution">{reconcileView.stats.practicing}</strong><span>待补练活动</span></div>
+            <div><strong class={reconcileView.stats.openCount ? 'critical' : 'ok'}>{reconcileView.stats.openCount}</strong><span>待确认</span></div>
+          </div>
+
+          <section class="pending-section">
+            <div class="subsection-title">
+              <h3>待确认队列</h3>
+              <p>漏掉前置活动、同一活动冲突结果或缺号记录先列在这里；组长确认后才写回学情。</p>
+            </div>
+            <div class="pending-grid">
+              {#each reconcileView.openIdentity as item (item.id)}
+                {@const missingStudent = !resultById(item.resultIds[0])?.studentId}
+                {@const missingActivity = !resultById(item.resultIds[0])?.activityId}
+                <article class="pending-card identity">
+                  <Tag type="purple">缺号确认</Tag>
+                  <h4>{item.name || '姓名缺失'} · {item.date}</h4>
+                  <p>缺{#if missingStudent && missingActivity}学生编号和活动编号{:else if missingStudent}学生编号{:else}活动编号{/if}，凭姓名、日期、音素人工核对。</p>
+                  <div class="phoneme-line">{#each item.phonemes as phoneme}<span>{phoneme}</span>{/each}</div>
+                  <div class="pending-foot"><small>建议：{item.studentId || '学生?'} × {item.activityId || '活动?'}</small>
+                    {#if reconcile.role === 'leader'}
+                      <Button size="small" on:click={() => openPending(item)}>确认编号</Button>
+                    {:else}<Button size="small" kind="ghost" disabled>需组长确认</Button>{/if}
+                  </div>
+                </article>
+              {/each}
+              {#each reconcileView.openConflict as item (item.id)}
+                <article class="pending-card conflict">
+                  <Tag type="red">结果冲突</Tag>
+                  <h4>{item.name} · {item.studentId} × {item.activityId}</h4>
+                  <p>同一活动出现通过与未通过两种结果，须裁决以哪条为准。</p>
+                  <ul class="score-list">
+                    {#each item.conflictScores ?? [] as score}
+                      <li class:pass={score.score >= 60} class:fail={score.score < 60}><b>{score.score}</b><span>{score.date} · {score.packageLabel}</span></li>
+                    {/each}
+                  </ul>
+                  <div class="pending-foot">
+                    {#if reconcile.role === 'leader'}
+                      <Button size="small" on:click={() => openPending(item)}>组长裁决</Button>
+                    {:else}<Button size="small" kind="ghost" disabled>需组长裁决</Button>{/if}
+                  </div>
+                </article>
+              {/each}
+              {#each reconcileView.openPrerequisite as item (item.id)}
+                <article class="pending-card prerequisite">
+                  <Tag type="magenta">漏掉前置</Tag>
+                  <h4>{item.name} · {item.studentId} × {item.activityId}</h4>
+                  <p>已通过「{activityTitle(item.activityId)}」但缺少前置通过记录：</p>
+                  <div class="dep-line">{#each item.missingDependencyIds ?? [] as dep}<span>{dep} · {activityTitle(dep)}</span>{/each}</div>
+                  <div class="pending-foot">
+                    {#if reconcile.role === 'leader'}
+                      <Button size="small" on:click={() => openPending(item)}>确认处理</Button>
+                    {:else}<Button size="small" kind="ghost" disabled>需组长确认</Button>{/if}
+                  </div>
+                </article>
+              {/each}
+              {#if reconcileView.stats.openCount === 0}
+                <Tile class="pending-empty"><h4>没有待确认项</h4><p>结果包与课程匹配一致；新结果包导入后会自动重新核对。</p></Tile>
+              {/if}
+            </div>
+          </section>
+
+          <section class="plans-section">
+            <div class="subsection-title">
+              <h3>补练清单 <small>（按当前课程即时计算，不落死表）</small></h3>
+              <p>分数或日期变化、课程顺序/音素/依赖调整都会让旧安排失效并按新课程重算。</p>
+            </div>
+            {#if reconcileView.plans.length}
+              <div class="plans-table-wrap">
+                <table class="plans-table">
+                  <thead><tr><th>学生</th><th>补练活动</th><th>音素</th><th>原因</th><th>先回补</th><th>状态</th></tr></thead>
+                  <tbody>
+                    {#each reconcileView.plans as plan (plan.id)}
+                      <tr class:needs-confirm={plan.needsConfirmation}>
+                        <td><b>{plan.name}</b><small>{plan.studentId}</small></td>
+                        <td>{activityTitle(plan.activityId)}<small>{plan.activityId}</small></td>
+                        <td><div class="phoneme-line tight">{#each plan.phonemes as phoneme}<span>{phoneme}</span>{/each}</div></td>
+                        <td>{#each plan.reasons as reason, ri}{#if ri > 0}<br>{/if}{reason}{/each}</td>
+                        <td>{#if plan.foundationActivityIds.length}{#each plan.foundationActivityIds as foundation, fi}{#if fi > 0}<br>{/if}{foundation} · {activityTitle(foundation)}{/each}{:else}—{/if}</td>
+                        <td>{#if plan.needsConfirmation}<Tag type="magenta">待组长确认</Tag>{:else}<Tag type="green">已安排</Tag>{/if}</td>
+                      </tr>
+                    {/each}
+                  </tbody>
+                </table>
+              </div>
+            {:else}
+              <Tile class="pending-empty"><h4>暂无补练安排</h4><p>未达标活动与前置缺口都将自动出现在这里。</p></Tile>
+            {/if}
+          </section>
+
+          <section class="ledger-section">
+            <div class="subsection-title">
+              <h3>学情台账（按学生编号 × 活动编号配对）</h3>
+              <p>缺号记录在确认前不写入学情；同一结果重复上传只记一次；展开可查看修订链。</p>
+            </div>
+            <div class="ledger-table-wrap">
+              <table class="ledger-table">
+                <thead><tr><th></th><th>学生</th><th>活动</th><th>代表分数</th><th>日期</th><th>结果包</th><th>状态</th></tr></thead>
+                <tbody>
+                  {#each reconcileView.ledger as row (row.key)}
+                    {#if expandedLedgerKeys.includes(row.key)}
+                      <tr class="expanded-row" class:row-identity={row.status === 'identity'}>
+                        <td colspan="7">
+                          <div class="version-detail">
+                            <button on:click={() => toggleLedger(row.key)}>收起 ▴</button>
+                            <table>
+                              <thead><tr><th>分数</th><th>日期</th><th>结果包</th><th>记录</th></tr></thead>
+                              <tbody>
+                                {#each row.versions as version}
+                                  <tr class:superseded={version.supersededBy} class:pass={version.passed} class:fail={!version.passed}>
+                                    <td>{version.score}{version.supersededBy ? '（已被修订）' : ''}</td><td>{version.date}</td><td>{version.packageLabel}</td><td>{version.sourceRecordId || version.id}</td>
+                                  </tr>
+                                {/each}
+                              </tbody>
+                            </table>
+                            {#if row.status === 'prerequisite' && row.missingDependencyIds.length}
+                              <p class="missing-deps">缺前置：{#each row.missingDependencyIds as dep, di}{#if di > 0}、{/if}{dep} · {activityTitle(dep)}{/each}{row.waived ? '（组长已豁免）' : ''}</p>
+                            {/if}
+                          </div>
+                        </td>
+                      </tr>
+                    {/if}
+                    <tr class:row-identity={row.status === 'identity'} class="row-missing-activity={row.activityMissing}">
+                      <td>{#if row.versions.length > 1 || row.versions[0]?.history.length}<button class="expand-btn" on:click={() => toggleLedger(row.key)}>{expandedLedgerKeys.includes(row.key) ? '▴' : '▾'} {row.versions.length + (row.versions[0]?.history.length ?? 0)}</button>{/if}</td>
+                      <td>{#if row.status === 'identity'}<Tag type="purple">缺号</Tag> {row.name || '未知'}<small>待确认学生</small>{:else}<b>{row.name}</b><small>{row.studentId}</small>{/if}</td>
+                      <td>{#if row.status === 'identity'}<small>{row.representative.activityId || '待确认活动'}</small>{:else}{activityTitle(row.activityId)}<small>{row.activityId}{#if row.activityMissing} · 已不在当前课程{/if}</small>{/if}</td>
+                      <td class:pass={row.representative.passed} class:fail={!row.representative.passed}>{row.representative.score}</td>
+                      <td>{row.representative.date}</td>
+                      <td>{row.representative.packageLabel}</td>
+                      <td>
+                        {#if row.status === 'mastered'}<Tag type="green">已掌握</Tag>
+                        {:else if row.status === 'practicing'}<Tag type="red">未掌握·补练</Tag>
+                        {:else if row.status === 'conflict'}<Tag type="red">冲突待裁决</Tag>
+                        {:else if row.status === 'prerequisite'}<Tag type="magenta">{row.waived ? '前置已豁免' : '漏前置待确认'}</Tag>
+                        {:else if row.status === 'identity'}<Tag type="purple">缺号待确认</Tag>{/if}
+                      </td>
+                    </tr>
+                  {/each}
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="roster-section">
+            <div class="subsection-title"><h3>学生名册与结果包</h3><p>同一学生跨多个结果包的结果合并核对。</p></div>
+            <div class="roster-grid">
+              {#each reconcileView.roster as student (student.studentId)}
+                <article>
+                  <h4>{student.name}</h4>
+                  <small>{student.studentId}</small>
+                  <dl>
+                    <div><dt>结果包</dt><dd>{student.packages}</dd></div>
+                    <div><dt>有效活动</dt><dd>{student.results}</dd></div>
+                    <div class="ok"><dt>已掌握</dt><dd>{student.mastered}</dd></div>
+                    <div class="caution"><dt>补练</dt><dd>{student.planCount}</dd></div>
+                  </dl>
+                </article>
+              {:else}
+                <Tile class="pending-empty"><h4>还没有核对记录</h4><p>点击“导入结果包”，粘贴课堂听读小程序导出的 JSON（也支持带表头 CSV）。</p></Tile>
+              {/each}
+            </div>
+          </section>
+
+          {#if reconcile.confirmations.length}
+            <section class="log-section">
+              <div class="subsection-title"><h3>确认与写回记录</h3><p>关闭页面再回来仍保留所有确认、裁决与冲突轨迹。</p></div>
+              <ol class="confirmation-log">
+                {#each [...reconcile.confirmations].reverse() as entry}
+                  <li><span class="log-by {entry.by}">{entry.by === 'leader' ? '组长' : '教师'}</span><div><b>{entry.action}</b><p>{entry.detail}</p><small>{formatTime(entry.at)}</small></div></li>
+                {/each}
+              </ol>
+            </section>
+          {/if}
+        </div>
+      {/if}
     </main>
   {/if}
 
@@ -805,6 +1238,94 @@
       </div>
     </main>
   {/if}
+
+  <Modal
+    open={importModalOpen}
+    modalHeading="导入课堂听读结果包"
+    modalLabel="跨系统对账"
+    primaryButtonText="开始核对"
+    secondaryButtonText="取消"
+    size="lg"
+    on:click:button--primary={() => performImport()}
+    on:click:button--secondary={closeImport}
+    on:close={closeImport}
+  >
+    <div class="import-modal-body">
+      <p class="modal-help">粘贴课堂听读小程序导出的 JSON（或带表头 CSV），系统会按学生编号与活动编号配对；缺号时用姓名、日期、音素进入待确认。</p>
+      <label class="file-picker">
+        <input type="file" accept=".json,.csv,application/json,text/csv,text/plain" on:change={readImportFile} />
+        <span>也可选择 .json / .csv 结果文件</span>
+      </label>
+      <TextArea rows={12} labelText="结果包内容" placeholder="粘贴 JSON：results 数组，每条含 studentId、activityId、name、date、phonemes、score；也支持带表头 CSV。" value={importDraft} on:input={(event) => { importDraft = readText(event); importError = ''; }} />
+      {#if importError}<InlineNotification lowContrast kind="error" title="无法导入" subtitle={importError} />{/if}
+    </div>
+  </Modal>
+
+  <Modal
+    open={pendingModalOpen}
+    modalHeading={activePending?.kind === 'identity' ? '确认缺号结果' : activePending?.kind === 'conflict' ? '裁决冲突结果' : '处理漏掉的前置活动'}
+    modalLabel={reconcile.role === 'leader' ? '教研组长确认' : '需要教研组长权限'}
+    primaryButtonText={reconcile.role === 'leader' ? '确认并写回学情' : '仅组长可确认'}
+    primaryButtonDisabled={reconcile.role !== 'leader'}
+    secondaryButtonText="取消"
+    size="lg"
+    on:click:button--primary={submitPending}
+    on:click:button--secondary={closePending}
+    on:close={closePending}
+  >
+    {#if activePending}
+      {@const item = activePending}
+      <div class="pending-modal-body">
+        <div class="pending-evidence">
+          <Tag type={item.kind === 'identity' ? 'purple' : item.kind === 'conflict' ? 'red' : 'magenta'}>
+            {item.kind === 'identity' ? '缺号确认' : item.kind === 'conflict' ? '结果冲突' : '漏掉前置'}
+          </Tag>
+          <p>姓名：<b>{item.name || '—'}</b>　日期：<b>{item.date}</b>　音素：{#each item.phonemes as phoneme}<span class="mini-phoneme">{phoneme}</span>{:else}—{/each}</p>
+        </div>
+
+        {#if reconcile.role !== 'leader'}
+          <InlineNotification lowContrast kind="warning" title="权限不足" subtitle="普通教师不能越权处理待确认项，请切换到教研组长身份后再确认。" />
+        {/if}
+
+        {#if item.kind === 'identity'}
+          <div class="pending-form-grid">
+            <TextInput labelText="学生编号" value={pendingDraft.studentId} on:input={(event) => pendingDraft.studentId = readText(event)} placeholder="如 S1004" />
+            <Select labelText="活动编号（按课程活动）" selected={pendingDraft.activityId} on:change={(event) => pendingDraft.activityId = readText(event)}>
+              <SelectItem value="" text="请选择活动" />
+              {#each course.activities as activity}
+                <SelectItem value={activity.id} text={`${activity.id} · ${activity.title}（${activity.phonemes.join(' ')}）`} />
+              {/each}
+            </Select>
+          </div>
+          <p class="modal-help">系统已根据音素 {item.phonemes.join(' ')} 与姓名给出建议，请对照原始听课记录确认后再写回。</p>
+        {:else if item.kind === 'conflict'}
+          <div class="conflict-choice">
+            {#each item.conflictScores ?? [] as score}
+              <label class:chosen={pendingDraft.winnerResultId === score.resultId} class:pass={score.score >= 60} class:fail={score.score < 60}>
+                <input type="radio" name="winner" value={score.resultId} checked={pendingDraft.winnerResultId === score.resultId} on:change={(event) => pendingDraft.winnerResultId = (event.currentTarget as HTMLInputElement).value} />
+                <b>{score.score} 分 · {score.score >= 60 ? '通过' : '未通过'}</b>
+                <span>{score.date} · {score.packageLabel}</span>
+              </label>
+            {/each}
+          </div>
+          <p class="modal-help">未选中的结果会保留在修订链中可追溯，学情以选中结果为准并重算补练。</p>
+        {:else}
+          <div class="prereq-choice">
+            <label class:chosen={pendingDraft.decision === 'practice'}>
+              <input type="radio" name="prereq-decision" value="practice" checked={pendingDraft.decision === 'practice'} on:change={() => pendingDraft.decision = 'practice'} />
+              <b>安排前置补练</b><span>把缺失的前置活动加入补练清单，完成后再进入本活动。</span>
+            </label>
+            <label class:chosen={pendingDraft.decision === 'waive'}>
+              <input type="radio" name="prereq-decision" value="waive" checked={pendingDraft.decision === 'waive'} on:change={() => pendingDraft.decision = 'waive'} />
+              <b>组长批准豁免</b><span>确认该生已在课堂中口头掌握，豁免这些前置依赖（留痕）。</span>
+            </label>
+          </div>
+        {/if}
+        <TextInput labelText="确认说明（可选）" value={pendingDraft.note} on:input={(event) => pendingDraft.note = readText(event)} placeholder="如：已对照纸质听课表核实" />
+        {#if actionError}<InlineNotification lowContrast kind="error" title="无法处理" subtitle={actionError} />{/if}
+      </div>
+    {/if}
+  </Modal>
 
   <footer class="app-footer">
     <span>所有数据保存在当前浏览器 localStorage</span>
