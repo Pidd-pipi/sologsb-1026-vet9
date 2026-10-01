@@ -11,6 +11,17 @@
     TextInput,
     Tile
   } from 'carbon-components-svelte';
+  import {
+    ingestPackage,
+    resolvePending,
+    samplePackage,
+    type IngestReport,
+    type ListeningResult,
+    type PendingItem,
+    type ResultPackage
+  } from '$lib/results';
+  import { recomputePlans, confirmPlan, type RemedialPlan } from '$lib/remedial';
+  import { loadResultsState, saveResultsState, emptyResultsState, type ResultsPersistShape } from '$lib/results-store';
 
   type ActivityType = '音素' | '单词' | '句子' | '练习';
   type ViewMode = 'compose' | 'path' | 'issues' | 'versions';
@@ -173,6 +184,21 @@
   let diagnostics: Diagnostic[] = [];
   let versionDiff: VersionDiff[] = [];
 
+  // 听读结果对账（质量检查页子页签）
+  let qaTab: 'diagnostics' | 'reconcile' = 'diagnostics';
+  let resultsState: ResultsPersistShape = { ...emptyResultsState };
+  let lastReport: IngestReport | null = null;
+  let ingestError = '';
+  let hydrateResults = false;
+  $: plans = recomputePlans(resultsState.plans, resultsState.results, resultsState.learning, course.activities);
+  $: activeResults = resultsState.results.filter((r) => r.status === 'active');
+  $: openPending = resultsState.pending.filter((p) => !p.resolved);
+  $: resolvedPending = resultsState.pending.filter((p) => p.resolved);
+  $: totalDuplicates = resultsState.packages.reduce((sum, pkg) => sum + pkg.duplicates, 0);
+  $: stalePlans = plans.filter((p) => p.status === 'stale').length;
+  // 课程顺序、音素或依赖一改，补练清单立即按新课程重算并持久化。
+  $: if (hydrated && hydrateResults) saveResultsState({ ...resultsState, plans });
+
   $: selectedActivity = course.activities.find((activity) => activity.id === selectedActivityId) ?? course.activities[0] ?? null;
   $: diagnostics = analyzeCourse(course);
   $: versionDiff = compareCourseVersions(course, compareBaseId, compareTargetId);
@@ -194,6 +220,8 @@
       }
     }
     hydrated = true;
+    resultsState = loadResultsState();
+    hydrateResults = true;
     const updateNetwork = () => {
       online = navigator.onLine;
       showOfflineNotice = !online;
@@ -385,6 +413,80 @@
   function focusIssue(issue: Diagnostic): void {
     selectedActivityId = issue.activityId;
     activeView = 'compose';
+  }
+
+  // ── 听读结果对账 ──────────────────────────────────────────────
+  function persistResults(): void {
+    saveResultsState({ ...resultsState, plans });
+  }
+
+  function setRole(role: 'teacher' | 'leader'): void {
+    resultsState = { ...resultsState, role };
+  }
+
+  function ingestText(text: string, packageName: string): void {
+    ingestError = '';
+    try {
+      const parsed = JSON.parse(text) as Partial<ResultPackage> | ResultPackage['records'];
+      const pkg: ResultPackage = Array.isArray(parsed)
+        ? { packageName, exportedAt: new Date().toISOString(), records: parsed }
+        : {
+            packageName: parsed.packageName ?? packageName,
+            exportedAt: parsed.exportedAt ?? new Date().toISOString(),
+            records: Array.isArray(parsed.records) ? parsed.records : []
+          };
+      if (!pkg.records.length) throw new Error('empty');
+      const { state, report } = ingestPackage(resultsState, pkg, course.activities);
+      resultsState = state;
+      lastReport = report;
+      persistResults();
+    } catch {
+      ingestError = '结果包无法解析：请使用另一套小程序导出的 JSON 结果包（需包含 records 数组）。';
+    }
+  }
+
+  async function onPackageFile(event: Event): Promise<void> {
+    const input = event.target as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!file) return;
+    const text = await file.text();
+    ingestText(text, file.name.replace(/\.json$/i, ''));
+    input.value = '';
+  }
+
+  function loadSamplePackage(): void {
+    const pkg = samplePackage();
+    ingestText(JSON.stringify(pkg), pkg.packageName);
+  }
+
+  function actOnPending(item: PendingItem, resolution: 'confirmed' | 'rejected', chosenActivityId: string = ''): void {
+    const leader = resultsState.role === 'leader' ? '组长' : '';
+    const next = resolvePending(resultsState, item.id, resolution, leader, course.activities, chosenActivityId || undefined);
+    resultsState = next;
+    persistResults();
+  }
+
+  function actOnPlan(planId: string): void {
+    resultsState = { ...resultsState, plans: confirmPlan(plans, planId) };
+    persistResults();
+  }
+
+  function clearAllResults(): void {
+    resultsState = { ...emptyResultsState };
+    lastReport = null;
+    persistResults();
+  }
+
+  function activityTitleOf(activityId: string): string {
+    return course.activities.find((a) => a.id === activityId)?.title ?? activityId;
+  }
+
+  function resultActivityTitle(rec: ListeningResult): string {
+    if (rec.matchedActivityId) {
+      const activity = course.activities.find((a) => a.id === rec.matchedActivityId);
+      if (activity) return activity.title;
+    }
+    return rec.activityName || rec.activityId || '待确认';
   }
 
   function analyzeCourse(current: Course): Diagnostic[] {
@@ -743,9 +845,19 @@
   {#if activeView === 'issues'}
     <main class="issues-view">
       <div class="view-heading">
-        <div><span class="kicker">CURRICULUM QA</span><h2>课程质量检查</h2><p>检查前置知识、相似音、例句长度、练习反馈、无障碍说明和依赖完整性。</p></div>
+        <div><span class="kicker">CURRICULUM QA</span><h2>课程质量检查</h2><p>检查前置知识、相似音、例句长度、练习反馈、无障碍说明和依赖完整性，并跨系统核对听读结果。</p></div>
         <div class="issue-summary"><span><b>{errorCount}</b> 必须处理</span><span><b>{warningCount}</b> 建议调整</span><span><b>{diagnostics.length}</b> 全部提示</span></div>
       </div>
+
+      <nav class="qa-subtabs" aria-label="质量检查子页签">
+        <button class:active={qaTab === 'diagnostics'} on:click={() => qaTab = 'diagnostics'}><span>01</span>课程诊断</button>
+        <button class:active={qaTab === 'reconcile'} on:click={() => qaTab = 'reconcile'}>
+          <span>02</span>听读结果对账
+          {#if openPending.length}<em class="tab-badge">{openPending.length}</em>{/if}
+        </button>
+      </nav>
+
+      {#if qaTab === 'diagnostics'}
       <div class="issue-board">
         {#each diagnostics as issue, index}
           <article class:critical={issue.level === 'error'} class:caution={issue.level === 'warning'} class:info={issue.level === 'info'}>
@@ -765,6 +877,220 @@
           </div>
         {/if}
       </div>
+      {/if}
+
+      {#if qaTab === 'reconcile'}
+      <div class="reconcile-board">
+        <Tile class="reconcile-toolbar">
+          <div class="toolbar-group">
+            <span class="kicker">ROLE</span>
+            <div class="role-switch" role="group" aria-label="角色切换">
+              <button class:active={resultsState.role === 'teacher'} on:click={() => setRole('teacher')}>普通教师</button>
+              <button class:active={resultsState.role === 'leader'} on:click={() => setRole('leader')}>组长</button>
+            </div>
+            <small>{resultsState.role === 'leader' ? '组长可确认待核对冲突并写回学情' : '教师可上传核对，待确认事项需组长处理'}</small>
+          </div>
+          <div class="toolbar-group">
+            <Button size="small" kind="primary" on:click={loadSamplePackage}>载入示例结果包</Button>
+            <label class="file-button">
+              <Button size="small" kind="tertiary" on:click={() => {}}>导入结果包（JSON）</Button>
+              <input type="file" accept="application/json,.json" on:change={onPackageFile} />
+            </label>
+            <Button size="small" kind="danger-ghost" on:click={clearAllResults}>清空对账</Button>
+          </div>
+        </Tile>
+
+        {#if ingestError}
+          <InlineNotification lowContrast kind="error" title="导入失败" subtitle={ingestError} />
+        {/if}
+        {#if lastReport}
+          <InlineNotification
+            lowContrast
+            kind={lastReport.conflicts || lastReport.pending ? 'warning' : 'success'}
+            title="结果包核对完成"
+            subtitle={`新增 ${lastReport.inserted} 条 · 重复忽略 ${lastReport.duplicates} 条 · 成绩变化重算 ${lastReport.updated} 条 · 冲突 ${lastReport.conflicts} 条 · 待确认 ${lastReport.pending} 条`}
+          />
+        {/if}
+
+        <div class="reconcile-stats">
+          <div><strong>{activeResults.length}</strong><span>有效结果</span></div>
+          <div><strong class="caution">{openPending.length}</strong><span>待确认</span></div>
+          <div><strong class="critical">{openPending.filter((p) => p.kind === 'conflict').length}</strong><span>冲突</span></div>
+          <div><strong>{totalDuplicates}</strong><span>重复忽略</span></div>
+          <div><strong>{resultsState.learning.length}</strong><span>学情记录</span></div>
+          <div><strong class={stalePlans ? 'critical' : ''}>{plans.length}</strong><span>补练清单{stalePlans ? `（${stalePlans} 项待重算）` : ''}</span></div>
+        </div>
+
+        <Tile class="reconcile-section">
+          <div class="section-title">
+            <div><span class="kicker">PENDING</span><h3>待确认事项</h3><p>漏前置活动、同活动冲突、缺号无法配对的结果先列待确认；普通教师不能越权处理，组长确认后才写回学情。</p></div>
+            <Tag type={openPending.length ? 'red' : 'green'}>{openPending.length} 项待处理</Tag>
+          </div>
+          {#if openPending.length === 0}
+            <p class="empty-state">没有待确认事项。所有结果包均已按编号、姓名、日期与音素自动核对。</p>
+          {/if}
+          <div class="pending-list">
+            {#each openPending as item}
+              <article class="pending-card {item.kind}">
+                <div class="pending-head">
+                  <Tag type={item.kind === 'conflict' ? 'red' : item.kind === 'missing-prerequisite' ? 'magenta' : 'blue'}>
+                    {item.kind === 'conflict' ? '冲突结果' : item.kind === 'missing-prerequisite' ? '漏前置' : item.kind === 'unmatched-activity' ? '缺号待配对' : '缺学生'}
+                  </Tag>
+                  <small>{item.date} · {item.studentName}</small>
+                </div>
+                <h4>{item.title}</h4>
+                <p>{item.detail}</p>
+                {#if item.kind === 'unmatched-activity' && item.candidateActivityIds.length}
+                  <div class="candidate-pick">
+                    <label for={`cand-${item.id}`}>确认对应活动：</label>
+                    <Select id={`cand-${item.id}`} labelText="" bind:value={item.candidateActivityIds[0]}>
+                      {#each item.candidateActivityIds as candId}
+                        <SelectItem value={candId} text={activityTitleOf(candId)} />
+                      {/each}
+                    </Select>
+                  </div>
+                {/if}
+                <div class="pending-actions">
+                  {#if item.kind !== 'missing-student'}
+                    <Button
+                      size="small"
+                      kind="primary"
+                      disabled={resultsState.role !== 'leader'}
+                      on:click={() => actOnPending(item, 'confirmed', item.kind === 'unmatched-activity' ? item.candidateActivityIds[0] : undefined)}
+                    >{resultsState.role === 'leader' ? '组长确认并写回学情' : '仅组长可确认'}</Button>
+                  {/if}
+                  <Button size="small" kind="danger-ghost" disabled={resultsState.role !== 'leader'} on:click={() => actOnPending(item, 'rejected')}>驳回</Button>
+                  {#if resultsState.role !== 'leader'}<span class="role-hint">当前为普通教师，不能处理待确认事项</span>{/if}
+                </div>
+              </article>
+            {/each}
+          </div>
+          {#if resolvedPending.length}
+            <details class="resolved-details">
+              <summary>已处理事项（{resolvedPending.length}）</summary>
+              <div class="resolved-list">
+                {#each resolvedPending as item}
+                  <div class="resolved-row">
+                    <Tag type={item.resolution === 'confirmed' ? 'green' : 'cool-gray'}>{item.resolution === 'confirmed' ? '已确认' : '已驳回'}</Tag>
+                    <span>{item.title}</span>
+                    <small>{item.resolvedBy} · {item.resolvedAt ? formatTime(item.resolvedAt) : ''}</small>
+                  </div>
+                {/each}
+              </div>
+            </details>
+          {/if}
+        </Tile>
+
+        <Tile class="reconcile-section">
+          <div class="section-title">
+            <div><span class="kicker">REMEDIAL</span><h3>补练清单</h3><p>依据当前课程顺序、音素与依赖实时重算；课程调整后已确认的清单会标记待重算。</p></div>
+            <Tag type={stalePlans ? 'magenta' : 'cool-gray'}>{plans.length} 人 · {stalePlans} 待重算</Tag>
+          </div>
+          {#if plans.length === 0}
+            <p class="empty-state">暂无补练安排。所有已核对学生在已确认活动上均达到掌握要求。</p>
+          {/if}
+          <div class="plan-list">
+            {#each plans as plan}
+              <article class="plan-card {plan.status}">
+                <div class="plan-head">
+                  <b>{plan.studentName}</b>
+                  <Tag type={plan.status === 'confirmed' ? 'green' : plan.status === 'stale' ? 'magenta' : 'red'}>
+                    {plan.status === 'confirmed' ? '已确认' : plan.status === 'stale' ? '待重算' : '待确认'}
+                  </Tag>
+                </div>
+                <h4>{plan.activityTitle}</h4>
+                <p>{plan.reason}</p>
+                <div class="phoneme-chips">{#each plan.phonemes as ph}<span>{ph}</span>{/each}</div>
+                <div class="suggested">
+                  <small>建议补练：</small>
+                  {#each plan.suggestedIds as sugId, index}
+                    <button class="suggest-chip" on:click={() => { selectedActivityId = sugId; activeView = 'compose'; }}>
+                      {index + 1}. {activityTitleOf(sugId)}
+                    </button>
+                  {/each}
+                </div>
+                <div class="pending-actions">
+                  <Button size="small" kind="primary" disabled={resultsState.role !== 'leader' || plan.status === 'confirmed'} on:click={() => actOnPlan(plan.id)}>
+                    {plan.status === 'confirmed' ? '已安排补练' : resultsState.role === 'leader' ? '组长确认补练安排' : '仅组长可确认'}
+                  </Button>
+                </div>
+              </article>
+            {/each}
+          </div>
+        </Tile>
+
+        <Tile class="reconcile-section">
+          <div class="section-title">
+            <div><span class="kicker">LEARNING</span><h3>学情记录</h3><p>正常结果自动写回，待确认事项经组长确认后写回。</p></div>
+            <Tag type="cool-gray">{resultsState.learning.length} 条</Tag>
+          </div>
+          {#if resultsState.learning.length === 0}
+            <p class="empty-state">尚无学情记录。导入结果包并核对后，掌握情况会写回这里。</p>
+          {/if}
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead><tr><th>学生</th><th>活动</th><th>音素</th><th>得分</th><th>状态</th><th>日期</th><th>确认</th></tr></thead>
+              <tbody>
+                {#each resultsState.learning as rec}
+                  <tr>
+                    <td>{rec.studentName}</td>
+                    <td>{rec.activityTitle}</td>
+                    <td>{rec.phonemes.join('、')}</td>
+                    <td>{rec.score}/{rec.fullScore}</td>
+                    <td><Tag type={rec.mastered ? 'green' : 'red'}>{rec.mastered ? '已掌握' : '未掌握'}</Tag></td>
+                    <td>{rec.date}</td>
+                    <td>{rec.confirmedBy}</td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+        </Tile>
+
+        <Tile class="reconcile-section">
+          <div class="section-title">
+            <div><span class="kicker">EVIDENCE</span><h3>结果明细</h3><p>来自另一套小程序的原始听读结果，按编号、姓名、日期与音素配对。</p></div>
+            <Tag type="cool-gray">{activeResults.length} 有效 / {resultsState.results.length} 总计</Tag>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead><tr><th>学生</th><th>活动</th><th>配对方式</th><th>音素</th><th>得分</th><th>状态</th><th>来源包</th></tr></thead>
+              <tbody>
+                {#each resultsState.results as rec}
+                  <tr class:superseded={rec.status === 'superseded'} class:held={rec.status === 'held'}>
+                    <td>{rec.studentName || rec.studentId || '—'}</td>
+                    <td>{resultActivityTitle(rec)}</td>
+                    <td><Tag type={rec.matchMethod === 'id' ? 'blue' : rec.matchMethod === 'name' ? 'teal' : rec.matchMethod === 'phoneme' ? 'magenta' : 'red'}>{rec.matchMethod === 'id' ? '编号' : rec.matchMethod === 'name' ? '名称' : rec.matchMethod === 'phoneme' ? '音素' : '未配对'}</Tag></td>
+                    <td>{rec.phonemes.join('、')}</td>
+                    <td>{rec.score}/{rec.fullScore}</td>
+                    <td><Tag type={rec.status === 'active' ? 'green' : rec.status === 'held' ? 'red' : 'cool-gray'}>{rec.status === 'active' ? '有效' : rec.status === 'held' ? '待裁决' : '已失效'}</Tag></td>
+                    <td>{rec.packageName}</td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+        </Tile>
+
+        <Tile class="reconcile-section">
+          <div class="section-title">
+            <div><span class="kicker">PACKAGES</span><h3>上传记录</h3><p>同一结果重复上传只记一次；分数或日期变化会让对应补练安排失效重算。</p></div>
+          </div>
+          {#if resultsState.packages.length === 0}
+            <p class="empty-state">尚未导入结果包。</p>
+          {/if}
+          <div class="package-log">
+            {#each resultsState.packages as pkg}
+              <article>
+                <b>{pkg.packageName}</b>
+                <small>导出 {pkg.exportedAt ? formatTime(pkg.exportedAt) : '—'} · 上传 {formatTime(pkg.uploadedAt)}</small>
+                <span>新增 {pkg.inserted} · 重复 {pkg.duplicates} · 重算 {pkg.updated} · 待确认 {pkg.pending}</span>
+              </article>
+            {/each}
+          </div>
+        </Tile>
+      </div>
+      {/if}
     </main>
   {/if}
 
